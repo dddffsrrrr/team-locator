@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "team_locator",
+  "version": "1.0.0",
+  "name": "Team Locator",
+  "description": "Teammates teilen ihre Position per Team-Chat; die Mod zeigt sie als Markierung mit Name und Koordinaten an.",
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": { "client": ["dev.example.teamlocator.TeamLocatorClient"] },
+  "depends": {
+    "fabricloader": ">=0.18.1",
+    "minecraft": "1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
