@@ -94,7 +94,8 @@ public class TeamLocatorClient implements ClientModInitializer {
     private static boolean enabled = true;
     private static String password = "";
     private static String broker = "broker.hivemq.com:8883";
-    private static int intervalSeconds = 2;
+    /** How often to send while moving, in milliseconds (min. 250). */
+    private static int intervalMs = 500;
     private static float hudScale = 0.75f;
     /** HUD position: corner (topleft, topright, bottomleft, bottomright) + distance from that corner in pixels. */
     private static String hudCorner = "topleft";
@@ -103,10 +104,10 @@ public class TeamLocatorClient implements ClientModInitializer {
     /** Show the HUD as a preview until this time (after moving it). */
     private static long previewUntilMs = 0;
 
-    private static final int EXPIRE_SECONDS = 120;     // entry disappears without updates
-    private static final int STALE_SECONDS = 30;       // shown grey after this
-    private static final int FORCE_SEND_SECONDS = 20;  // send at least this often, even when standing still
-    private static final double MIN_MOVE = 3.0;        // blocks moved before sending again
+    private static final int EXPIRE_SECONDS = 60;      // entry disappears without updates
+    private static final int STALE_SECONDS = 15;       // shown grey after this
+    private static final int FORCE_SEND_SECONDS = 5;   // send at least this often, even when standing still
+    private static final double MIN_MOVE = 1.0;        // blocks moved before sending again
     private static final long MAX_CLOCK_SKEW_MS = 10 * 60 * 1000L;
 
     // ------------------------------------------------------------------- State
@@ -198,7 +199,7 @@ public class TeamLocatorClient implements ClientModInitializer {
         MARKS.values().removeIf(m -> now - m.timeMs() > EXPIRE_SECONDS * 1000L);
 
         if (!enabled || !sharing || !onServer || link == null) return;
-        if (lastSendMs != 0 && ++tickCounter < Math.max(1, intervalSeconds) * 20) return;
+        if (lastSendMs != 0 && ++tickCounter < Math.max(5, intervalMs / 50)) return;
         tickCounter = 0;
 
         double x = mc.player.getX(), y = mc.player.getY(), z = mc.player.getZ();
@@ -432,11 +433,11 @@ public class TeamLocatorClient implements ClientModInitializer {
                                             return 1;
                                         })))
                         .then(ClientCommandManager.literal("interval")
-                                .then(ClientCommandManager.argument("seconds", IntegerArgumentType.integer(1, 60))
+                                .then(ClientCommandManager.argument("milliseconds", IntegerArgumentType.integer(250, 60000))
                                         .executes(ctx -> {
-                                            intervalSeconds = IntegerArgumentType.getInteger(ctx, "seconds");
+                                            intervalMs = IntegerArgumentType.getInteger(ctx, "milliseconds");
                                             saveConfig();
-                                            feedback(ctx, "Interval: " + intervalSeconds + "s");
+                                            feedback(ctx, "Interval: " + intervalMs + " ms");
                                             return 1;
                                         })))
                         .then(ClientCommandManager.literal("size")
@@ -503,7 +504,7 @@ public class TeamLocatorClient implements ClientModInitializer {
         password = p.getProperty("password", password);
         broker = p.getProperty("broker", broker);
         try {
-            intervalSeconds = Math.max(1, Integer.parseInt(p.getProperty("intervalSeconds", "" + intervalSeconds)));
+            intervalMs = Math.max(250, Integer.parseInt(p.getProperty("intervalMs", "" + intervalMs)));
         } catch (NumberFormatException ignored) { }
         try {
             hudScale = Math.max(0.5f, Math.min(1.5f, Float.parseFloat(p.getProperty("hudScale", "" + hudScale))));
@@ -522,7 +523,7 @@ public class TeamLocatorClient implements ClientModInitializer {
         p.setProperty("enabled", "" + enabled);
         p.setProperty("password", password);
         p.setProperty("broker", broker);
-        p.setProperty("intervalSeconds", "" + intervalSeconds);
+        p.setProperty("intervalMs", "" + intervalMs);
         p.setProperty("hudScale", "" + hudScale);
         p.setProperty("hudCorner", hudCorner);
         p.setProperty("hudOffsetX", "" + hudOffsetX);
