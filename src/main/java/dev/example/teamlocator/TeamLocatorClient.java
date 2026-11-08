@@ -72,6 +72,21 @@ import net.minecraft.resources.Identifier; // older mappings: ResourceLocation
  */
 public class TeamLocatorClient implements ClientModInitializer {
 
+    private static int setCorner(CommandContext<FabricClientCommandSource> ctx, String corner) {
+        hudCorner = corner;
+        hudOffsetX = 4;
+        hudOffsetY = 4;
+        showPreview(ctx);
+        return 1;
+    }
+
+    private static void showPreview(CommandContext<FabricClientCommandSource> ctx) {
+        saveConfig();
+        previewUntilMs = System.currentTimeMillis() + 6000;
+        feedback(ctx, "HUD position: " + hudCorner + ", " + hudOffsetX + " " + hudOffsetY
+                + " (distance from that corner). Change with /tl pos <x> <y>");
+    }
+
     // ------------------------------------------------------------------ Config
     private static final Path CONFIG =
             FabricLoader.getInstance().getConfigDir().resolve("team-locator.properties");
@@ -81,6 +96,12 @@ public class TeamLocatorClient implements ClientModInitializer {
     private static String broker = "broker.hivemq.com:8883";
     private static int intervalSeconds = 2;
     private static float hudScale = 0.75f;
+    /** HUD position: corner (topleft, topright, bottomleft, bottomright) + distance from that corner in pixels. */
+    private static String hudCorner = "topleft";
+    private static int hudOffsetX = 4;
+    private static int hudOffsetY = 4;
+    /** Show the HUD as a preview until this time (after moving it). */
+    private static long previewUntilMs = 0;
 
     private static final int EXPIRE_SECONDS = 120;     // entry disappears without updates
     private static final int STALE_SECONDS = 30;       // shown grey after this
@@ -273,8 +294,12 @@ public class TeamLocatorClient implements ClientModInitializer {
     // ------------------------------------------------------------------ HUD
 
     private static void render(Minecraft mc, GuiGraphics g) {
-        if (!enabled || mc.player == null || mc.level == null || mc.options.hideGui) return;
-        if (MARKS.isEmpty() && !sharing) return;
+        if (mc.player == null || mc.level == null || mc.options.hideGui) return;
+        boolean preview = System.currentTimeMillis() < previewUntilMs;
+        if (!preview) {
+            if (!enabled) return;
+            if (MARKS.isEmpty() && !sharing) return;
+        }
 
         String myDim = currentDimension(mc);
         long now = System.currentTimeMillis();
@@ -301,14 +326,29 @@ public class TeamLocatorClient implements ClientModInitializer {
 
         boolean online = link != null && link.isConnected();
         String header = "Team" + (sharing ? " §a●" : "") + (online ? "" : " §c(offline)");
+        if (preview && lines.isEmpty()) {
+            lines.add(new Line("Steve ↗ 245 blocks", 0xFFFFFFFF, 0));
+            lines.add(new Line("Alex → 1203 blocks", 0xFFFFFFFF, 0));
+            header = "Team §e(preview)";
+        }
 
         int pad = 3, lineH = 10;
         int w = mc.font.width(header);
         for (Line l : lines) w = Math.max(w, mc.font.width(l.text()));
         int h = lineH * (1 + lines.size());
 
+        // Box size on screen (after scaling) -> position from the chosen corner
+        int boxW = Math.round((w + pad * 2) * hudScale);
+        int boxH = Math.round((h + pad * 2 - 2) * hudScale);
+        boolean right = hudCorner.endsWith("right");
+        boolean bottom = hudCorner.startsWith("bottom");
+        int sx = right ? g.guiWidth() - boxW - hudOffsetX : hudOffsetX;
+        int sy = bottom ? g.guiHeight() - boxH - hudOffsetY : hudOffsetY;
+        sx = Math.max(0, Math.min(g.guiWidth() - boxW, sx));
+        sy = Math.max(0, Math.min(g.guiHeight() - boxH, sy));
+
         g.pose().pushMatrix();
-        g.pose().translate(4, 4);
+        g.pose().translate(sx, sy);
         g.pose().scale(hudScale, hudScale);
         g.fill(0, 0, w + pad * 2, h + pad * 2 - 2, 0x66000000);
         g.drawString(mc.font, header, pad, pad, 0xFF80FFFF, true);
@@ -360,6 +400,7 @@ public class TeamLocatorClient implements ClientModInitializer {
                                     + "§r | Password: " + (crypto != null ? "set" : "§cmissing§r")
                                     + " | Channel: " + (online ? "§aconnected§r" : "§cdisconnected§r")
                                     + " | Sharing: " + (sharing ? "on" : "off")
+                                    + " | HUD: " + hudCorner + " " + hudOffsetX + " " + hudOffsetY
                                     + " | Keys: " + keyName(toggleShareKey) + " = share, "
                                     + keyName(toggleAllKey) + " = mod on/off");
                             return 1;
@@ -403,9 +444,34 @@ public class TeamLocatorClient implements ClientModInitializer {
                                         .executes(ctx -> {
                                             hudScale = IntegerArgumentType.getInteger(ctx, "percent") / 100f;
                                             saveConfig();
+                                            previewUntilMs = System.currentTimeMillis() + 6000;
                                             feedback(ctx, "HUD size: " + Math.round(hudScale * 100) + "%");
                                             return 1;
                                         })))
+                        .then(ClientCommandManager.literal("pos")
+                                .then(ClientCommandManager.literal("topleft").executes(ctx -> setCorner(ctx, "topleft")))
+                                .then(ClientCommandManager.literal("topright").executes(ctx -> setCorner(ctx, "topright")))
+                                .then(ClientCommandManager.literal("bottomleft").executes(ctx -> setCorner(ctx, "bottomleft")))
+                                .then(ClientCommandManager.literal("bottomright").executes(ctx -> setCorner(ctx, "bottomright")))
+                                .then(ClientCommandManager.literal("reset").executes(ctx -> {
+                                    hudCorner = "topleft";
+                                    hudOffsetX = 4;
+                                    hudOffsetY = 4;
+                                    showPreview(ctx);
+                                    return 1;
+                                }))
+                                .then(ClientCommandManager.argument("x", IntegerArgumentType.integer(0, 2000))
+                                        .then(ClientCommandManager.argument("y", IntegerArgumentType.integer(0, 2000))
+                                                .executes(ctx -> {
+                                                    hudOffsetX = IntegerArgumentType.getInteger(ctx, "x");
+                                                    hudOffsetY = IntegerArgumentType.getInteger(ctx, "y");
+                                                    showPreview(ctx);
+                                                    return 1;
+                                                })))
+                                .executes(ctx -> {
+                                    showPreview(ctx);
+                                    return 1;
+                                }))
                         .then(ClientCommandManager.literal("broker")
                                 .then(ClientCommandManager.argument("hostport", StringArgumentType.greedyString())
                                         .executes(ctx -> {
@@ -442,6 +508,12 @@ public class TeamLocatorClient implements ClientModInitializer {
         try {
             hudScale = Math.max(0.5f, Math.min(1.5f, Float.parseFloat(p.getProperty("hudScale", "" + hudScale))));
         } catch (NumberFormatException ignored) { }
+        String corner = p.getProperty("hudCorner", hudCorner);
+        if (List.of("topleft", "topright", "bottomleft", "bottomright").contains(corner)) hudCorner = corner;
+        try {
+            hudOffsetX = Math.max(0, Integer.parseInt(p.getProperty("hudOffsetX", "" + hudOffsetX)));
+            hudOffsetY = Math.max(0, Integer.parseInt(p.getProperty("hudOffsetY", "" + hudOffsetY)));
+        } catch (NumberFormatException ignored) { }
         saveConfig();
     }
 
@@ -452,6 +524,9 @@ public class TeamLocatorClient implements ClientModInitializer {
         p.setProperty("broker", broker);
         p.setProperty("intervalSeconds", "" + intervalSeconds);
         p.setProperty("hudScale", "" + hudScale);
+        p.setProperty("hudCorner", hudCorner);
+        p.setProperty("hudOffsetX", "" + hudOffsetX);
+        p.setProperty("hudOffsetY", "" + hudOffsetY);
         try {
             Files.createDirectories(CONFIG.getParent());
             try (Writer w = Files.newBufferedWriter(CONFIG, StandardCharsets.UTF_8)) {
