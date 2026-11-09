@@ -53,9 +53,16 @@ import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.PlayerFaceRenderer;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.player.AbstractClientPlayer;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.phys.Vec3;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier; // older mappings: ResourceLocation
 
@@ -101,6 +108,17 @@ public class TeamLocatorClient implements ClientModInitializer {
     private static String hudCorner = "topleft";
     private static int hudOffsetX = 4;
     private static int hudOffsetY = 4;
+    // Head markers (waypoints)
+    private static boolean showHeads = true;       // player heads in the world direction
+    private static boolean showHeadDistance = true;
+    private static boolean showHeadName = false;
+    private static boolean edgeMarkers = true;     // keep off-screen heads at the screen edge
+    private static boolean showList = true;        // the small team list box
+    private static int headSize = 12;              // pixels
+    private static int hideCloser = 4;             // hide head when closer than this (blocks)
+    private static int maxHeadDistance = 0;        // 0 = unlimited
+    private static boolean openConfigNextTick = false;
+
     /** Show the HUD as a preview until this time (after moving it). */
     private static long previewUntilMs = 0;
 
@@ -114,10 +132,13 @@ public class TeamLocatorClient implements ClientModInitializer {
     private record Mark(String name, String dimension, double x, double y, double z, long timeMs) {}
 
     private static final Map<String, Mark> MARKS = new ConcurrentHashMap<>();
+    /** Smoothed display positions for heads: x, y, z, lastNanos. Avoids jumping between updates. */
+    private static final Map<String, double[]> SMOOTH = new ConcurrentHashMap<>();
     private static final String[] ARROWS = {"↑", "↗", "→", "↘", "↓", "↙", "←", "↖"};
 
     private static KeyMapping toggleShareKey;
     private static KeyMapping toggleAllKey;
+    private static KeyMapping configKey;
 
     private static boolean sharing = false;
     private static int tickCounter = 0;
@@ -150,6 +171,8 @@ public class TeamLocatorClient implements ClientModInitializer {
                 "key.team_locator.toggle_share", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_O, cat));
         toggleAllKey = KeyBindingHelper.registerKeyBinding(new KeyMapping(
                 "key.team_locator.toggle_all", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_K, cat));
+        configKey = KeyBindingHelper.registerKeyBinding(new KeyMapping(
+                "key.team_locator.config", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_J, cat));
 
         ClientTickEvents.END_CLIENT_TICK.register(TeamLocatorClient::tick);
 
@@ -161,7 +184,15 @@ public class TeamLocatorClient implements ClientModInitializer {
         });
 
         HudElementRegistry.addLast(Identifier.fromNamespaceAndPath("team_locator", "hud"),
-                (g, delta) -> render(Minecraft.getInstance(), g));
+                (g, delta) -> {
+                    Minecraft mc = Minecraft.getInstance();
+                    try {
+                        renderHeads(mc, g, delta);
+                    } catch (Exception e) {
+                        // never crash the game because of a marker
+                    }
+                    if (showList || System.currentTimeMillis() < previewUntilMs) render(mc, g);
+                });
 
         registerCommands();
     }
@@ -182,6 +213,11 @@ public class TeamLocatorClient implements ClientModInitializer {
         if (!wantLink && link != null) stopLink();
 
         while (toggleAllKey.consumeClick()) setEnabled(mc, !enabled);
+        while (configKey.consumeClick()) openConfigNextTick = true;
+        if (openConfigNextTick) {
+            openConfigNextTick = false;
+            mc.setScreen(new ConfigScreen(mc.screen));
+        }
 
         while (toggleShareKey.consumeClick()) {
             if (!enabled) {
@@ -207,6 +243,7 @@ public class TeamLocatorClient implements ClientModInitializer {
 
         long now = System.currentTimeMillis();
         MARKS.values().removeIf(m -> now - m.timeMs() > EXPIRE_SECONDS * 1000L);
+        SMOOTH.keySet().retainAll(MARKS.keySet());
 
         if (!enabled || !sharing || !onServer || link == null) return;
         if (lastSendMs != 0 && ++tickCounter < Math.max(5, intervalMs / 50)) return;
@@ -400,6 +437,157 @@ public class TeamLocatorClient implements ClientModInitializer {
         g.pose().popMatrix();
     }
 
+    // ------------------------------------------------------------------ Head markers (waypoints)
+
+    private static final String[] EDGE_ARROWS = {"→", "↘", "↓", "↙", "←", "↖", "↑", "↗"};
+
+    private static void renderHeads(Minecraft mc, GuiGraphics g, DeltaTracker delta) {
+        if (!enabled || !showHeads || mc.player == null || mc.level == null || mc.options.hideGui) return;
+        if (MARKS.isEmpty()) return;
+
+        float pt = delta.getGameTimeDeltaPartialTick(true);
+        Vec3 eye = mc.player.getEyePosition(pt);
+        double yawDeg = mc.player.getViewYRot(pt);
+        double pitchDeg = mc.player.getViewXRot(pt);
+        if (mc.options.getCameraType().isMirrored()) { // third person, front view
+            yawDeg += 180;
+            pitchDeg = -pitchDeg;
+        }
+        double yaw = Math.toRadians(yawDeg);
+        double pitch = Math.toRadians(pitchDeg);
+        double fov = Math.toRadians(mc.options.fov().get());
+        int w = g.guiWidth(), h = g.guiHeight();
+        double scale = (h / 2.0) / Math.tan(fov / 2.0);
+        double cx = w / 2.0, cy = h / 2.0;
+        String myDim = currentDimension(mc);
+        long nowNs = System.nanoTime();
+        long now = System.currentTimeMillis();
+        int size = headSize;
+        int margin = size / 2 + 12;
+
+        for (Mark mk : MARKS.values()) {
+            if (!mk.dimension().equals(myDim)) continue;
+            String key = mk.name().toLowerCase(Locale.ROOT);
+
+            // Position: real entity if loaded (perfectly smooth), otherwise smoothed network position
+            Player ent = findLoaded(mc, mk.name());
+            double tx, ty, tz;
+            if (ent != null) {
+                Vec3 p = ent.getPosition(pt);
+                tx = p.x; ty = p.y + ent.getBbHeight() + 0.5; tz = p.z;
+                SMOOTH.put(key, new double[]{p.x, p.y, p.z, nowNs});
+            } else {
+                double[] sm = SMOOTH.get(key);
+                double jump = sm == null ? Double.MAX_VALUE
+                        : Math.abs(sm[0] - mk.x()) + Math.abs(sm[1] - mk.y()) + Math.abs(sm[2] - mk.z());
+                if (sm == null || jump > 64) { // first time or teleport -> snap
+                    sm = new double[]{mk.x(), mk.y(), mk.z(), nowNs};
+                    SMOOTH.put(key, sm);
+                }
+                double dt = Math.min(0.25, (nowNs - sm[3]) / 1e9);
+                sm[3] = nowNs;
+                double a = 1 - Math.exp(-dt * 6.0);
+                sm[0] += (mk.x() - sm[0]) * a;
+                sm[1] += (mk.y() - sm[1]) * a;
+                sm[2] += (mk.z() - sm[2]) * a;
+                tx = sm[0]; ty = sm[1] + 2.3; tz = sm[2];
+            }
+
+            double dx = tx - eye.x, dy = ty - eye.y, dz = tz - eye.z;
+            double dist = Math.sqrt(dx * dx + dz * dz);
+            if (dist < hideCloser) continue;
+            if (maxHeadDistance > 0 && dist > maxHeadDistance) continue;
+
+            // World -> screen (camera space)
+            double fwdH = -Math.sin(yaw) * dx + Math.cos(yaw) * dz;
+            double right = -Math.cos(yaw) * dx - Math.sin(yaw) * dz;
+            double depth = fwdH * Math.cos(pitch) - dy * Math.sin(pitch);
+            double up = fwdH * Math.sin(pitch) + dy * Math.cos(pitch);
+
+            double sx = cx, sy = cy;
+            boolean onScreen = false;
+            if (depth > 0.05) {
+                sx = cx + right / depth * scale;
+                sy = cy - up / depth * scale;
+                onScreen = sx >= margin && sx <= w - margin && sy >= margin && sy <= h - margin;
+            }
+            String arrow = "";
+            if (!onScreen) {
+                if (!edgeMarkers) continue;
+                // Direction on the screen plane; stable both in front and behind
+                double vx = right, vy = -up;
+                double len = Math.hypot(vx, vy);
+                if (len < 1e-6) { vx = 0; vy = 1; len = 1; }
+                vx /= len; vy /= len;
+                double hx = w / 2.0 - margin, hy = h / 2.0 - margin;
+                double t = Math.min(Math.abs(vx) > 1e-6 ? hx / Math.abs(vx) : Double.MAX_VALUE,
+                        Math.abs(vy) > 1e-6 ? hy / Math.abs(vy) : Double.MAX_VALUE);
+                sx = cx + vx * t;
+                sy = cy + vy * t;
+                double ang = Math.atan2(vy, vx); // 0 = right, positive = down
+                int idx = (int) Math.floorMod(Math.round(ang / (Math.PI / 4)), 8L);
+                arrow = EDGE_ARROWS[idx] + " ";
+            }
+
+            int x = (int) Math.round(sx) - size / 2;
+            int y = (int) Math.round(sy) - size / 2;
+            boolean stale = (now - mk.timeMs()) / 1000 > STALE_SECONDS && ent == null;
+            int tint = stale ? 0xFF888888 : 0xFFFFFFFF;
+
+            // Head with a thin dark border
+            g.fill(x - 1, y - 1, x + size + 1, y + size + 1, 0xC0000000);
+            if (!drawFace(mc, g, ent, mk.name(), x, y, size, tint)) {
+                g.fill(x, y, x + size, y + size, stale ? 0xFF555555 : 0xFF3A6EA5);
+                String initial = mk.name().substring(0, 1).toUpperCase(Locale.ROOT);
+                g.drawCenteredString(mc.font, initial, x + size / 2, y + (size - 8) / 2, 0xFFFFFFFF);
+            }
+
+            // Small labels (scaled down so they don't get in the way)
+            float ts = 0.75f;
+            if (showHeadName) {
+                drawSmallCentered(mc, g, mk.name(), x + size / 2, y - 8, ts, 0xFFFFFFFF);
+            }
+            if (showHeadDistance) {
+                drawSmallCentered(mc, g, arrow + Math.round(dist) + "m", x + size / 2, y + size + 3, ts,
+                        stale ? 0xFFAAAAAA : 0xFFFFFFFF);
+            }
+        }
+    }
+
+    private static void drawSmallCentered(Minecraft mc, GuiGraphics g, String text, int cx, int y, float s, int color) {
+        int tw = mc.font.width(text);
+        g.pose().pushMatrix();
+        g.pose().translate(cx, y);
+        g.pose().scale(s, s);
+        g.fill(-tw / 2 - 2, -1, tw / 2 + 2, 9, 0x80000000);
+        g.drawString(mc.font, text, -tw / 2, 0, color, true);
+        g.pose().popMatrix();
+    }
+
+    /** Draws the player's face from their skin. Returns false if no skin is known yet. */
+    private static boolean drawFace(Minecraft mc, GuiGraphics g, Player ent, String name, int x, int y, int size, int tint) {
+        if (ent instanceof AbstractClientPlayer acp) {
+            PlayerFaceRenderer.draw(g, acp.getSkin(), x, y, size, tint);
+            return true;
+        }
+        if (mc.getConnection() != null) {
+            var info = mc.getConnection().getPlayerInfo(name);
+            if (info != null) {
+                PlayerFaceRenderer.draw(g, info.getSkin(), x, y, size, tint);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static Player findLoaded(Minecraft mc, String name) {
+        if (mc.level == null) return null;
+        for (Player p : mc.level.players()) {
+            if (p.getGameProfile().name().equalsIgnoreCase(name)) return p;
+        }
+        return null;
+    }
+
     private static String currentDimension(Minecraft mc) {
         return mc.level.dimension().identifier().toString(); // older mappings: .location()
     }
@@ -521,6 +709,10 @@ public class TeamLocatorClient implements ClientModInitializer {
                                             feedback(ctx, "Broker: " + broker);
                                             return 1;
                                         })))
+                        .then(ClientCommandManager.literal("config").executes(ctx -> {
+                            openConfigNextTick = true; // open after the chat screen has closed
+                            return 1;
+                        }))
                         .then(ClientCommandManager.literal("debug").executes(ctx -> {
                             boolean online = link != null && link.isConnected();
                             feedback(ctx, "Server key: " + (myServer.isEmpty() ? "§c(not on a server)§r" : myServer)
@@ -561,6 +753,16 @@ public class TeamLocatorClient implements ClientModInitializer {
         try {
             hudScale = Math.max(0.5f, Math.min(1.5f, Float.parseFloat(p.getProperty("hudScale", "" + hudScale))));
         } catch (NumberFormatException ignored) { }
+        showHeads = Boolean.parseBoolean(p.getProperty("showHeads", "" + showHeads));
+        showHeadDistance = Boolean.parseBoolean(p.getProperty("showHeadDistance", "" + showHeadDistance));
+        showHeadName = Boolean.parseBoolean(p.getProperty("showHeadName", "" + showHeadName));
+        edgeMarkers = Boolean.parseBoolean(p.getProperty("edgeMarkers", "" + edgeMarkers));
+        showList = Boolean.parseBoolean(p.getProperty("showList", "" + showList));
+        try {
+            headSize = Math.max(8, Math.min(32, Integer.parseInt(p.getProperty("headSize", "" + headSize))));
+            hideCloser = Math.max(0, Integer.parseInt(p.getProperty("hideCloser", "" + hideCloser)));
+            maxHeadDistance = Math.max(0, Integer.parseInt(p.getProperty("maxHeadDistance", "" + maxHeadDistance)));
+        } catch (NumberFormatException ignored) { }
         String corner = p.getProperty("hudCorner", hudCorner);
         if (List.of("topleft", "topright", "bottomleft", "bottomright").contains(corner)) hudCorner = corner;
         try {
@@ -578,6 +780,14 @@ public class TeamLocatorClient implements ClientModInitializer {
         p.setProperty("intervalMs", "" + intervalMs);
         p.setProperty("hudScale", "" + hudScale);
         p.setProperty("hudCorner", hudCorner);
+        p.setProperty("showHeads", "" + showHeads);
+        p.setProperty("showHeadDistance", "" + showHeadDistance);
+        p.setProperty("showHeadName", "" + showHeadName);
+        p.setProperty("edgeMarkers", "" + edgeMarkers);
+        p.setProperty("showList", "" + showList);
+        p.setProperty("headSize", "" + headSize);
+        p.setProperty("hideCloser", "" + hideCloser);
+        p.setProperty("maxHeadDistance", "" + maxHeadDistance);
         p.setProperty("hudOffsetX", "" + hudOffsetX);
         p.setProperty("hudOffsetY", "" + hudOffsetY);
         try {
@@ -587,6 +797,127 @@ public class TeamLocatorClient implements ClientModInitializer {
             }
         } catch (IOException e) {
             System.err.println("[Team Locator] Could not save config: " + e.getMessage());
+        }
+    }
+
+    // ======================================================================
+    // Settings screen (key J, /tl config, or Mod Menu -> Team Locator -> Configure)
+    // ======================================================================
+    static Screen createConfigScreen(Screen parent) {
+        return new ConfigScreen(parent);
+    }
+
+    static final class ConfigScreen extends Screen {
+        private static final int[] SIZES = {8, 10, 12, 14, 16, 20, 24, 32};
+        private static final int[] HIDE = {0, 2, 4, 8, 16, 32};
+        private static final int[] MAXD = {0, 100, 250, 500, 1000, 2500, 5000};
+        private static final int[] SPEED = {250, 500, 1000, 2000, 5000};
+        private static final int[] SCALE = {50, 60, 75, 90, 100, 125, 150};
+        private static final String[] CORNERS = {"topleft", "topright", "bottomleft", "bottomright"};
+
+        private final Screen parent;
+
+        ConfigScreen(Screen parent) {
+            super(Component.literal("Team Locator Settings"));
+            this.parent = parent;
+        }
+
+        private static String onOff(boolean b) {
+            return b ? "§aON" : "§cOFF";
+        }
+
+        private static int next(int[] values, int current) {
+            for (int i = 0; i < values.length; i++) {
+                if (values[i] == current) return values[(i + 1) % values.length];
+            }
+            return values[0];
+        }
+
+        private Button toggle(int x, int y, int w, String label, java.util.function.BooleanSupplier get,
+                              Runnable flip) {
+            return Button.builder(Component.literal(label + ": " + onOff(get.getAsBoolean())), b -> {
+                flip.run();
+                saveConfig();
+                b.setMessage(Component.literal(label + ": " + onOff(get.getAsBoolean())));
+            }).bounds(x, y, w, 20).build();
+        }
+
+        private Button cycle(int x, int y, int w, String label, java.util.function.Supplier<String> value,
+                             Runnable step) {
+            return Button.builder(Component.literal(label + ": " + value.get()), b -> {
+                step.run();
+                saveConfig();
+                previewUntilMs = System.currentTimeMillis() + 4000;
+                b.setMessage(Component.literal(label + ": " + value.get()));
+            }).bounds(x, y, w, 20).build();
+        }
+
+        @Override
+        protected void init() {
+            int colW = 150, gap = 10;
+            int left = this.width / 2 - colW - gap / 2;
+            int rightX = this.width / 2 + gap / 2;
+            int y = 40, row = 24;
+
+            // Left column: general + list
+            addRenderableWidget(toggle(left, y, colW, "Mod", () -> enabled,
+                    () -> setEnabled(Minecraft.getInstance(), !enabled)));
+            addRenderableWidget(toggle(left, y + row, colW, "Share my position", () -> sharing, () -> {
+                if (!sharing && (crypto == null)) return;
+                sharing = !sharing;
+                if (sharing) lastSendMs = 0; else sendBye();
+            }));
+            addRenderableWidget(cycle(left, y + row * 2, colW, "Update speed",
+                    () -> intervalMs + " ms", () -> intervalMs = next(SPEED, intervalMs)));
+            addRenderableWidget(toggle(left, y + row * 3, colW, "Team list", () -> showList,
+                    () -> showList = !showList));
+            addRenderableWidget(cycle(left, y + row * 4, colW, "List corner",
+                    () -> hudCorner, () -> {
+                        int i = java.util.Arrays.asList(CORNERS).indexOf(hudCorner);
+                        hudCorner = CORNERS[(i + 1) % CORNERS.length];
+                        hudOffsetX = 4;
+                        hudOffsetY = 4;
+                    }));
+            addRenderableWidget(cycle(left, y + row * 5, colW, "List size",
+                    () -> Math.round(hudScale * 100) + "%",
+                    () -> hudScale = next(SCALE, Math.round(hudScale * 100)) / 100f));
+
+            // Right column: head markers
+            addRenderableWidget(toggle(rightX, y, colW, "Head markers", () -> showHeads,
+                    () -> showHeads = !showHeads));
+            addRenderableWidget(toggle(rightX, y + row, colW, "Show distance", () -> showHeadDistance,
+                    () -> showHeadDistance = !showHeadDistance));
+            addRenderableWidget(toggle(rightX, y + row * 2, colW, "Show name", () -> showHeadName,
+                    () -> showHeadName = !showHeadName));
+            addRenderableWidget(toggle(rightX, y + row * 3, colW, "Off-screen at edge", () -> edgeMarkers,
+                    () -> edgeMarkers = !edgeMarkers));
+            addRenderableWidget(cycle(rightX, y + row * 4, colW, "Head size",
+                    () -> headSize + " px", () -> headSize = next(SIZES, headSize)));
+            addRenderableWidget(cycle(rightX, y + row * 5, colW, "Hide closer than",
+                    () -> hideCloser == 0 ? "never" : hideCloser + " blocks",
+                    () -> hideCloser = next(HIDE, hideCloser)));
+            addRenderableWidget(cycle(rightX, y + row * 6, colW, "Max distance",
+                    () -> maxHeadDistance == 0 ? "unlimited" : maxHeadDistance + " blocks",
+                    () -> maxHeadDistance = next(MAXD, maxHeadDistance)));
+
+            addRenderableWidget(Button.builder(Component.literal("Done"), b -> onClose())
+                    .bounds(this.width / 2 - 100, this.height - 28, 200, 20).build());
+        }
+
+        @Override
+        public void render(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
+            super.render(g, mouseX, mouseY, partialTick);
+            g.drawCenteredString(this.font, this.title, this.width / 2, 12, 0xFFFFFFFF);
+            g.drawCenteredString(this.font, Component.literal("§7General & list"), this.width / 2 - 80, 28, 0xFFFFFFFF);
+            g.drawCenteredString(this.font, Component.literal("§7Head markers"), this.width / 2 + 80, 28, 0xFFFFFFFF);
+            String pw = crypto != null ? "§aPassword set" : "§cNo password - use /tl team <password>";
+            g.drawCenteredString(this.font, Component.literal(pw), this.width / 2, this.height - 44, 0xFFFFFFFF);
+        }
+
+        @Override
+        public void onClose() {
+            saveConfig();
+            if (this.minecraft != null) this.minecraft.setScreen(parent);
         }
     }
 

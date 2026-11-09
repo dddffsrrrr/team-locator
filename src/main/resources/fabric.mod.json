@@ -1,16 +1,22 @@
 {
   "schemaVersion": 1,
   "id": "team_locator",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "name": "Team Locator",
-  "description": "Teammates teilen ihre Position per Team-Chat; die Mod zeigt sie als Markierung mit Name und Koordinaten an.",
+  "description": "Share your position with friends through an encrypted channel (HiveMQ). Shows their heads as waypoints with distance, plus a small team list. Settings: key J, /tl config or Mod Menu.",
   "license": "MIT",
   "environment": "client",
-  "entrypoints": { "client": ["dev.example.teamlocator.TeamLocatorClient"] },
+  "entrypoints": {
+    "client": ["dev.example.teamlocator.TeamLocatorClient"],
+    "modmenu": ["dev.example.teamlocator.ModMenuIntegration"]
+  },
   "depends": {
     "fabricloader": ">=0.18.1",
     "minecraft": "1.21.11",
     "java": ">=21",
     "fabric-api": "*"
+  },
+  "suggests": {
+    "modmenu": "*"
   }
 }

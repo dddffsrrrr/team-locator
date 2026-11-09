@@ -1,36 +1,41 @@
-# Team Locator 1.0
+# Team Locator – encrypted channel via HiveMQ
 
-Jeder im Team installiert diese Mod. Wer teilt, schickt seine Position in den
-Team-Chat; alle mit der Mod sehen sie als Markierung: Name, darunter Koordinaten
-und Entfernung. Ohne Server-Mod, ohne OP.
+Positions are NOT sent through Minecraft chat. The mod encrypts them (AES-256) and sends
+them through a public message broker (broker.hivemq.com, TLS) straight to your friends' mods.
+Only people with the same team password can read them. The Minecraft server, its admins
+and other players see nothing. The mod only connects while you are on a multiplayer server
+and the mod is on (never in singleplayer, never in the main menu).
+All /tl commands are client-side and are never sent to the server.
 
-## Tasten (aenderbar unter Optionen > Steuerung)
-- P: Position einmal teilen
-- O: Auto-Teilen an/aus (sendet alle 15 s, solange an; unten links steht dann "● Teile Position")
-  Auto-Teilen geht beim Verlassen des Servers automatisch aus.
+## Setup (everyone, once)
+    /tl team <same-long-password>
+Agree on the password via Discord/WhatsApp, NOT in Minecraft chat.
 
-## Einrichten (WICHTIG)
-Den richtigen Team-Chat-Befehl des Servers einstellen, z.B.:
-    /tl setcommand team chat
-oder, falls der Server einen anderen Befehl nutzt (z.B. /tc):
-    /tl setcommand tc
-Die Mod sendet NIE in den oeffentlichen Chat, immer ueber diesen Befehl.
-Teste einmal mit P und /tl hide (macht die Nachrichten sichtbar), ob sie im Team-Chat ankommt.
+## Head markers (waypoints)
+Teammates who share their position appear as their skin face at the spot where they are,
+with the distance below. If they are off-screen, the head sticks to the screen edge with an arrow.
+Positions are smoothed so the heads glide instead of jumping.
 
-Weitere Befehle: /tl (Status), /tl interval <sekunden> (min. 5), /tl hide, /tl clear
+## Settings
+Open with key J, /tl config, or Mod Menu -> Team Locator -> Configure (if Mod Menu is installed).
+Everything can be toggled there: head markers, distance, name, edge markers, head size,
+hide distance, max distance, team list, list corner/size, update speed.
 
-## Bauen
-1. Template auf https://fabricmc.net/develop/template/ erzeugen
-   (Minecraft 1.21.11, Mojang Mappings, Package dev.example.teamlocator).
-2. Dessen src/main durch den src/main-Ordner aus diesem Projekt ersetzen.
-3. ./gradlew build -> build/libs/<name>.jar nach .minecraft/mods/ (bei allen Teammates)
+## Keys (Options > Controls > Key Binds, rebindable)
+- O: share position on/off
+- K: whole mod on/off
+- J: open settings (disconnects from HiveMQ immediately)
 
-## Falls der Build an Namen scheitert (aendern sich zwischen Versionen)
-- Identifier <-> ResourceLocation
-- dimension().location() <-> dimension().identifier()
-- getGameProfile().name() <-> getGameProfile().getName()
-- KeyMapping.Category.MISC <-> "key.categories.misc"
+## Commands
+/tl (status), /tl on, /tl off, /tl team <password>, /tl size <50-150>,
+/tl interval <250-60000> (milliseconds, default 500), /tl broker <host:port>, /tl clear
 
-## Hinweis
-Pruefe die Regeln des Servers zu Mods und automatischen Nachrichten. Ein zu kurzes
-Intervall kann vom Spamfilter erkannt werden; 15 s oder mehr ist sicherer.
+## Move the HUD
+/tl pos topleft | topright | bottomleft | bottomright   (pick a corner)
+/tl pos <x> <y>   (distance from that corner in pixels, e.g. /tl pos 10 40)
+/tl pos reset     (back to top left)
+/tl pos           (show a preview)
+
+## Privacy
+HiveMQ sees the IP address of everyone connected (use a VPN to hide yours),
+but cannot read the encrypted positions.
