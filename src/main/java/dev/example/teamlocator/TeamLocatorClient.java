@@ -85,6 +85,9 @@ import net.minecraft.resources.Identifier; // older mappings: ResourceLocation
  */
 public class TeamLocatorClient implements ClientModInitializer {
 
+    /** Real world FOV of the current frame (set by GameRendererMixin). -1 = unknown. */
+    public static volatile float renderFov = -1f;
+
     private static int setCorner(CommandContext<FabricClientCommandSource> ctx, String corner) {
         hudCorner = corner;
         hudOffsetX = 4;
@@ -470,7 +473,10 @@ public class TeamLocatorClient implements ClientModInitializer {
         Vec3 camPos = cam.position();
         Quaternionf toCamera = new Quaternionf(cam.rotation()).conjugate();
 
-        double fov = Math.toRadians(mc.options.fov().get());
+        // Real FOV of this frame (zoom, sprint effect, spyglass ...). Fallback: options value.
+        float rf = renderFov;
+        double fovDeg = (rf > 1f && rf < 179f) ? rf : mc.options.fov().get();
+        double fov = Math.toRadians(fovDeg);
         int w = g.guiWidth(), h = g.guiHeight();
         double scale = (h / 2.0) / Math.tan(fov / 2.0);
         double cx = w / 2.0, cy = h / 2.0;
@@ -487,28 +493,33 @@ public class TeamLocatorClient implements ClientModInitializer {
             String key = mk.name().toLowerCase(Locale.ROOT);
 
             // Position: real entity if loaded (perfectly smooth), otherwise smoothed network position
+            // Target: the real entity if it is loaded (exact, interpolated every frame),
+            // otherwise the last position received from the network.
             Player ent = findLoaded(mc, mk.name());
-            double tx, ty, tz;
+            double gx, gy, gz, rate;
             if (ent != null) {
                 Vec3 p = ent.getPosition(pt);
-                tx = p.x; ty = p.y + ent.getBbHeight() + 0.5; tz = p.z;
-                SMOOTH.put(key, new double[]{p.x, p.y, p.z, nowNs});
+                gx = p.x; gy = p.y; gz = p.z;
+                rate = 30.0;   // follows the entity almost exactly
             } else {
-                double[] sm = SMOOTH.get(key);
-                double jump = sm == null ? Double.MAX_VALUE
-                        : Math.abs(sm[0] - mk.x()) + Math.abs(sm[1] - mk.y()) + Math.abs(sm[2] - mk.z());
-                if (sm == null || jump > 64) { // first time or teleport -> snap
-                    sm = new double[]{mk.x(), mk.y(), mk.z(), nowNs};
-                    SMOOTH.put(key, sm);
-                }
-                double dt = Math.min(0.25, (nowNs - sm[3]) / 1e9);
-                sm[3] = nowNs;
-                double a = 1 - Math.exp(-dt * 6.0);
-                sm[0] += (mk.x() - sm[0]) * a;
-                sm[1] += (mk.y() - sm[1]) * a;
-                sm[2] += (mk.z() - sm[2]) * a;
-                tx = sm[0]; ty = sm[1] + 2.3; tz = sm[2];
+                gx = mk.x(); gy = mk.y(); gz = mk.z();
+                rate = 6.0;    // glides between network updates
             }
+            // One smoothed position for both cases -> no jump when a player gets loaded/unloaded
+            double[] sm = SMOOTH.get(key);
+            double jump = sm == null ? Double.MAX_VALUE
+                    : Math.abs(sm[0] - gx) + Math.abs(sm[1] - gy) + Math.abs(sm[2] - gz);
+            if (sm == null || jump > 64) { // first time, teleport or dimension change -> snap
+                sm = new double[]{gx, gy, gz, nowNs};
+                SMOOTH.put(key, sm);
+            }
+            double sdt = Math.min(0.25, (nowNs - sm[3]) / 1e9);
+            sm[3] = nowNs;
+            double a = 1 - Math.exp(-sdt * rate);
+            sm[0] += (gx - sm[0]) * a;
+            sm[1] += (gy - sm[1]) * a;
+            sm[2] += (gz - sm[2]) * a;
+            double tx = sm[0], ty = sm[1] + 2.3, tz = sm[2];
 
             // Distance is measured from YOUR player (not the free camera), like in normal play
             Vec3 me = mc.player.getPosition(pt);
@@ -577,28 +588,33 @@ public class TeamLocatorClient implements ClientModInitializer {
             float alpha = fade[0];
             if (alpha < 0.04f) continue;
 
-            int x = (int) Math.round(sx) - size / 2;
-            int y = (int) Math.round(sy) - size / 2;
             boolean stale = (now - mk.timeMs()) / 1000 > STALE_SECONDS && ent == null;
             int tint = withAlpha(stale ? 0x888888 : 0xFFFFFF, alpha);
+
+            // Draw around (sx, sy) with sub-pixel precision -> no 1-pixel jitter while turning
+            g.pose().pushMatrix();
+            g.pose().translate((float) sx, (float) sy);
+            int x = -size / 2;
+            int y = -size / 2;
 
             // Head with a thin dark border
             g.fill(x - 1, y - 1, x + size + 1, y + size + 1, withAlpha(0x000000, alpha * 0.75f));
             if (!drawFace(mc, g, ent, mk.name(), x, y, size, tint)) {
                 g.fill(x, y, x + size, y + size, withAlpha(stale ? 0x555555 : 0x3A6EA5, alpha));
                 String initial = mk.name().substring(0, 1).toUpperCase(Locale.ROOT);
-                g.drawCenteredString(mc.font, initial, x + size / 2, y + (size - 8) / 2, withAlpha(0xFFFFFF, alpha));
+                g.drawCenteredString(mc.font, initial, 0, y + (size - 8) / 2, withAlpha(0xFFFFFF, alpha));
             }
 
             // Small labels (scaled down so they don't get in the way)
             float ts = 0.75f;
             if (showHeadName) {
-                drawSmallCentered(mc, g, mk.name(), x + size / 2, y - 8, ts, withAlpha(0xFFFFFF, alpha), alpha);
+                drawSmallCentered(mc, g, mk.name(), 0, y - 8, ts, withAlpha(0xFFFFFF, alpha), alpha);
             }
             if (showHeadDistance) {
-                drawSmallCentered(mc, g, arrow + Math.round(dist) + "m", x + size / 2, y + size + 3, ts,
+                drawSmallCentered(mc, g, arrow + Math.round(dist) + "m", 0, y + size + 3, ts,
                         withAlpha(stale ? 0xAAAAAA : 0xFFFFFF, alpha), alpha);
             }
+            g.pose().popMatrix();
         }
     }
 

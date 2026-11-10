@@ -1,14 +1,18 @@
 {
   "schemaVersion": 1,
   "id": "team_locator",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "name": "Team Locator",
   "description": "Share your position with friends through an encrypted channel (HiveMQ). Shows their heads as waypoints with distance, plus a small team list. Settings: key J, /tl config or Mod Menu.",
   "license": "MIT",
   "environment": "client",
   "entrypoints": {
-    "client": ["dev.example.teamlocator.TeamLocatorClient"],
-    "modmenu": ["dev.example.teamlocator.ModMenuIntegration"]
+    "client": [
+      "dev.example.teamlocator.TeamLocatorClient"
+    ],
+    "modmenu": [
+      "dev.example.teamlocator.ModMenuIntegration"
+    ]
   },
   "depends": {
     "fabricloader": ">=0.18.1",
@@ -18,5 +22,8 @@
   },
   "suggests": {
     "modmenu": "*"
-  }
+  },
+  "mixins": [
+    "team_locator.mixins.json"
+  ]
 }

@@ -1,4 +1,4 @@
-# Team Locator – encrypted channel via HiveMQ
+# Team Locator 1.2 – encrypted channel via HiveMQ
 
 Positions are NOT sent through Minecraft chat. The mod encrypts them (AES-256) and sends
 them through a public message broker (broker.hivemq.com, TLS) straight to your friends' mods.
@@ -15,11 +15,14 @@ Agree on the password via Discord/WhatsApp, NOT in Minecraft chat.
 Teammates who share their position appear as their skin face at the spot where they are,
 with the distance below. If they are off-screen, the head sticks to the screen edge with an arrow.
 Positions are smoothed so the heads glide instead of jumping.
+The heads follow the real camera and the real field of view of each frame, so freelook, freecam,
+third person, zoom mods, spyglass and the sprint FOV effect all work.
+While you can actually see a teammate (on screen, no blocks in between), their head fades out.
 
 ## Settings
 Open with key J, /tl config, or Mod Menu -> Team Locator -> Configure (if Mod Menu is installed).
 Everything can be toggled there: head markers, distance, name, edge markers, head size,
-hide distance, max distance, team list, list corner/size, update speed.
+hide distance, max distance, hide when visible, team list, list corner/size, update speed.
 
 ## Keys (Options > Controls > Key Binds, rebindable)
 - O: share position on/off
