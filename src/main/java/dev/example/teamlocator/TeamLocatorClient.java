@@ -42,6 +42,9 @@ import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 
+import org.joml.Quaternionf;
+import org.joml.Vector3f;
+
 import org.lwjgl.glfw.GLFW;
 
 import net.fabricmc.api.ClientModInitializer;
@@ -53,6 +56,7 @@ import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.Camera;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
@@ -117,6 +121,8 @@ public class TeamLocatorClient implements ClientModInitializer {
     private static int headSize = 12;              // pixels
     private static int hideCloser = 4;             // hide head when closer than this (blocks)
     private static int maxHeadDistance = 0;        // 0 = unlimited
+    private static boolean hideWhenAiming = true;  // fade the head out when you look straight at the player
+    private static int aimRadius = 20;             // pixels around the crosshair
     private static boolean openConfigNextTick = false;
 
     /** Show the HUD as a preview until this time (after moving it). */
@@ -134,6 +140,9 @@ public class TeamLocatorClient implements ClientModInitializer {
     private static final Map<String, Mark> MARKS = new ConcurrentHashMap<>();
     /** Smoothed display positions for heads: x, y, z, lastNanos. Avoids jumping between updates. */
     private static final Map<String, double[]> SMOOTH = new ConcurrentHashMap<>();
+    /** Per player: current alpha, hidden-by-aim flag (0/1). Gives smooth fading without flicker. */
+    private static final Map<String, float[]> FADE = new ConcurrentHashMap<>();
+    private static long lastHeadFrameNs = 0;
     private static final String[] ARROWS = {"↑", "↗", "→", "↘", "↓", "↙", "←", "↖"};
 
     private static KeyMapping toggleShareKey;
@@ -244,6 +253,7 @@ public class TeamLocatorClient implements ClientModInitializer {
         long now = System.currentTimeMillis();
         MARKS.values().removeIf(m -> now - m.timeMs() > EXPIRE_SECONDS * 1000L);
         SMOOTH.keySet().retainAll(MARKS.keySet());
+        FADE.keySet().retainAll(MARKS.keySet());
 
         if (!enabled || !sharing || !onServer || link == null) return;
         if (lastSendMs != 0 && ++tickCounter < Math.max(5, intervalMs / 50)) return;
@@ -446,15 +456,13 @@ public class TeamLocatorClient implements ClientModInitializer {
         if (MARKS.isEmpty()) return;
 
         float pt = delta.getGameTimeDeltaPartialTick(true);
-        Vec3 eye = mc.player.getEyePosition(pt);
-        double yawDeg = mc.player.getViewYRot(pt);
-        double pitchDeg = mc.player.getViewXRot(pt);
-        if (mc.options.getCameraType().isMirrored()) { // third person, front view
-            yawDeg += 180;
-            pitchDeg = -pitchDeg;
-        }
-        double yaw = Math.toRadians(yawDeg);
-        double pitch = Math.toRadians(pitchDeg);
+
+        // Use the REAL camera (position + rotation). Freelook, freecam, third person and
+        // camera mods all change the camera, so the heads always stay on the right spot.
+        Camera cam = mc.gameRenderer.getMainCamera();
+        Vec3 camPos = cam.position();
+        Quaternionf toCamera = new Quaternionf(cam.rotation()).conjugate();
+
         double fov = Math.toRadians(mc.options.fov().get());
         int w = g.guiWidth(), h = g.guiHeight();
         double scale = (h / 2.0) / Math.tan(fov / 2.0);
@@ -462,6 +470,8 @@ public class TeamLocatorClient implements ClientModInitializer {
         String myDim = currentDimension(mc);
         long nowNs = System.nanoTime();
         long now = System.currentTimeMillis();
+        double frameDt = lastHeadFrameNs == 0 ? 0.016 : Math.min(0.25, (nowNs - lastHeadFrameNs) / 1e9);
+        lastHeadFrameNs = nowNs;
         int size = headSize;
         int margin = size / 2 + 12;
 
@@ -493,16 +503,17 @@ public class TeamLocatorClient implements ClientModInitializer {
                 tx = sm[0]; ty = sm[1] + 2.3; tz = sm[2];
             }
 
-            double dx = tx - eye.x, dy = ty - eye.y, dz = tz - eye.z;
-            double dist = Math.sqrt(dx * dx + dz * dz);
+            // Distance is measured from YOUR player (not the free camera), like in normal play
+            Vec3 me = mc.player.getPosition(pt);
+            double mdx = tx - me.x, mdz = tz - me.z;
+            double dist = Math.sqrt(mdx * mdx + mdz * mdz);
             if (dist < hideCloser) continue;
             if (maxHeadDistance > 0 && dist > maxHeadDistance) continue;
 
-            // World -> screen (camera space)
-            double fwdH = -Math.sin(yaw) * dx + Math.cos(yaw) * dz;
-            double right = -Math.cos(yaw) * dx - Math.sin(yaw) * dz;
-            double depth = fwdH * Math.cos(pitch) - dy * Math.sin(pitch);
-            double up = fwdH * Math.sin(pitch) + dy * Math.cos(pitch);
+            // World -> camera space with the camera's own rotation (handles yaw, pitch and roll)
+            Vector3f v = new Vector3f((float) (tx - camPos.x), (float) (ty - camPos.y), (float) (tz - camPos.z));
+            toCamera.transform(v);
+            double right = v.x(), up = v.y(), depth = -v.z();
 
             double sx = cx, sy = cy;
             boolean onScreen = false;
@@ -513,7 +524,10 @@ public class TeamLocatorClient implements ClientModInitializer {
             }
             String arrow = "";
             if (!onScreen) {
-                if (!edgeMarkers) continue;
+                if (!edgeMarkers) {
+                    FADE.remove(key);
+                    continue;
+                }
                 // Direction on the screen plane; stable both in front and behind
                 double vx = right, vy = -up;
                 double len = Math.hypot(vx, vy);
@@ -529,37 +543,57 @@ public class TeamLocatorClient implements ClientModInitializer {
                 arrow = EDGE_ARROWS[idx] + " ";
             }
 
+            // Fade out when you look straight at the player (with hysteresis -> no flicker)
+            float[] fade = FADE.computeIfAbsent(key, k -> new float[]{0f, 0f});
+            if (hideWhenAiming && onScreen) {
+                double fromCenter = Math.hypot(sx - cx, sy - cy);
+                if (fromCenter < aimRadius) fade[1] = 1f;                 // hide
+                else if (fromCenter > aimRadius * 1.5 + 4) fade[1] = 0f;  // show again
+            } else {
+                fade[1] = 0f;
+            }
+            float target = fade[1] == 1f ? 0f : 1f;
+            fade[0] += (float) ((target - fade[0]) * (1 - Math.exp(-frameDt * 12.0)));
+            float alpha = fade[0];
+            if (alpha < 0.04f) continue;
+
             int x = (int) Math.round(sx) - size / 2;
             int y = (int) Math.round(sy) - size / 2;
             boolean stale = (now - mk.timeMs()) / 1000 > STALE_SECONDS && ent == null;
-            int tint = stale ? 0xFF888888 : 0xFFFFFFFF;
+            int tint = withAlpha(stale ? 0x888888 : 0xFFFFFF, alpha);
 
             // Head with a thin dark border
-            g.fill(x - 1, y - 1, x + size + 1, y + size + 1, 0xC0000000);
+            g.fill(x - 1, y - 1, x + size + 1, y + size + 1, withAlpha(0x000000, alpha * 0.75f));
             if (!drawFace(mc, g, ent, mk.name(), x, y, size, tint)) {
-                g.fill(x, y, x + size, y + size, stale ? 0xFF555555 : 0xFF3A6EA5);
+                g.fill(x, y, x + size, y + size, withAlpha(stale ? 0x555555 : 0x3A6EA5, alpha));
                 String initial = mk.name().substring(0, 1).toUpperCase(Locale.ROOT);
-                g.drawCenteredString(mc.font, initial, x + size / 2, y + (size - 8) / 2, 0xFFFFFFFF);
+                g.drawCenteredString(mc.font, initial, x + size / 2, y + (size - 8) / 2, withAlpha(0xFFFFFF, alpha));
             }
 
             // Small labels (scaled down so they don't get in the way)
             float ts = 0.75f;
             if (showHeadName) {
-                drawSmallCentered(mc, g, mk.name(), x + size / 2, y - 8, ts, 0xFFFFFFFF);
+                drawSmallCentered(mc, g, mk.name(), x + size / 2, y - 8, ts, withAlpha(0xFFFFFF, alpha), alpha);
             }
             if (showHeadDistance) {
                 drawSmallCentered(mc, g, arrow + Math.round(dist) + "m", x + size / 2, y + size + 3, ts,
-                        stale ? 0xFFAAAAAA : 0xFFFFFFFF);
+                        withAlpha(stale ? 0xAAAAAA : 0xFFFFFF, alpha), alpha);
             }
         }
     }
 
-    private static void drawSmallCentered(Minecraft mc, GuiGraphics g, String text, int cx, int y, float s, int color) {
+    private static int withAlpha(int rgb, float alpha) {
+        int a = Math.max(0, Math.min(255, Math.round(alpha * 255)));
+        return (a << 24) | (rgb & 0xFFFFFF);
+    }
+
+    private static void drawSmallCentered(Minecraft mc, GuiGraphics g, String text, int cx, int y, float s, int color,
+                                          float alpha) {
         int tw = mc.font.width(text);
         g.pose().pushMatrix();
         g.pose().translate(cx, y);
         g.pose().scale(s, s);
-        g.fill(-tw / 2 - 2, -1, tw / 2 + 2, 9, 0x80000000);
+        g.fill(-tw / 2 - 2, -1, tw / 2 + 2, 9, withAlpha(0x000000, alpha * 0.5f));
         g.drawString(mc.font, text, -tw / 2, 0, color, true);
         g.pose().popMatrix();
     }
@@ -758,10 +792,12 @@ public class TeamLocatorClient implements ClientModInitializer {
         showHeadName = Boolean.parseBoolean(p.getProperty("showHeadName", "" + showHeadName));
         edgeMarkers = Boolean.parseBoolean(p.getProperty("edgeMarkers", "" + edgeMarkers));
         showList = Boolean.parseBoolean(p.getProperty("showList", "" + showList));
+        hideWhenAiming = Boolean.parseBoolean(p.getProperty("hideWhenAiming", "" + hideWhenAiming));
         try {
             headSize = Math.max(8, Math.min(32, Integer.parseInt(p.getProperty("headSize", "" + headSize))));
             hideCloser = Math.max(0, Integer.parseInt(p.getProperty("hideCloser", "" + hideCloser)));
             maxHeadDistance = Math.max(0, Integer.parseInt(p.getProperty("maxHeadDistance", "" + maxHeadDistance)));
+            aimRadius = Math.max(5, Math.min(100, Integer.parseInt(p.getProperty("aimRadius", "" + aimRadius))));
         } catch (NumberFormatException ignored) { }
         String corner = p.getProperty("hudCorner", hudCorner);
         if (List.of("topleft", "topright", "bottomleft", "bottomright").contains(corner)) hudCorner = corner;
@@ -788,6 +824,8 @@ public class TeamLocatorClient implements ClientModInitializer {
         p.setProperty("headSize", "" + headSize);
         p.setProperty("hideCloser", "" + hideCloser);
         p.setProperty("maxHeadDistance", "" + maxHeadDistance);
+        p.setProperty("hideWhenAiming", "" + hideWhenAiming);
+        p.setProperty("aimRadius", "" + aimRadius);
         p.setProperty("hudOffsetX", "" + hudOffsetX);
         p.setProperty("hudOffsetY", "" + hudOffsetY);
         try {
@@ -813,6 +851,7 @@ public class TeamLocatorClient implements ClientModInitializer {
         private static final int[] MAXD = {0, 100, 250, 500, 1000, 2500, 5000};
         private static final int[] SPEED = {250, 500, 1000, 2000, 5000};
         private static final int[] SCALE = {50, 60, 75, 90, 100, 125, 150};
+        private static final int[] AIM = {10, 15, 20, 30, 40, 60};
         private static final String[] CORNERS = {"topleft", "topright", "bottomleft", "bottomright"};
 
         private final Screen parent;
@@ -857,7 +896,7 @@ public class TeamLocatorClient implements ClientModInitializer {
             int colW = 150, gap = 10;
             int left = this.width / 2 - colW - gap / 2;
             int rightX = this.width / 2 + gap / 2;
-            int y = 40, row = 24;
+            int y = 44, row = 21;
 
             // Left column: general + list
             addRenderableWidget(toggle(left, y, colW, "Mod", () -> enabled,
@@ -899,19 +938,23 @@ public class TeamLocatorClient implements ClientModInitializer {
             addRenderableWidget(cycle(rightX, y + row * 6, colW, "Max distance",
                     () -> maxHeadDistance == 0 ? "unlimited" : maxHeadDistance + " blocks",
                     () -> maxHeadDistance = next(MAXD, maxHeadDistance)));
+            addRenderableWidget(toggle(rightX, y + row * 7, colW, "Hide when aiming", () -> hideWhenAiming,
+                    () -> hideWhenAiming = !hideWhenAiming));
+            addRenderableWidget(cycle(rightX, y + row * 8, colW, "Aim radius",
+                    () -> aimRadius + " px", () -> aimRadius = next(AIM, aimRadius)));
 
             addRenderableWidget(Button.builder(Component.literal("Done"), b -> onClose())
-                    .bounds(this.width / 2 - 100, this.height - 28, 200, 20).build());
+                    .bounds(this.width / 2 - 100, this.height - 26, 200, 20).build());
         }
 
         @Override
         public void render(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
             super.render(g, mouseX, mouseY, partialTick);
-            g.drawCenteredString(this.font, this.title, this.width / 2, 12, 0xFFFFFFFF);
-            g.drawCenteredString(this.font, Component.literal("§7General & list"), this.width / 2 - 80, 28, 0xFFFFFFFF);
-            g.drawCenteredString(this.font, Component.literal("§7Head markers"), this.width / 2 + 80, 28, 0xFFFFFFFF);
+            g.drawCenteredString(this.font, this.title, this.width / 2, 8, 0xFFFFFFFF);
             String pw = crypto != null ? "§aPassword set" : "§cNo password - use /tl team <password>";
-            g.drawCenteredString(this.font, Component.literal(pw), this.width / 2, this.height - 44, 0xFFFFFFFF);
+            g.drawCenteredString(this.font, Component.literal(pw), this.width / 2, 20, 0xFFFFFFFF);
+            g.drawCenteredString(this.font, Component.literal("§7General & list"), this.width / 2 - 80, 33, 0xFFFFFFFF);
+            g.drawCenteredString(this.font, Component.literal("§7Head markers"), this.width / 2 + 80, 33, 0xFFFFFFFF);
         }
 
         @Override
