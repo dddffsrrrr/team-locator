@@ -66,6 +66,8 @@ import net.minecraft.client.gui.components.PlayerFaceRenderer;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier; // older mappings: ResourceLocation
@@ -121,8 +123,7 @@ public class TeamLocatorClient implements ClientModInitializer {
     private static int headSize = 12;              // pixels
     private static int hideCloser = 4;             // hide head when closer than this (blocks)
     private static int maxHeadDistance = 0;        // 0 = unlimited
-    private static boolean hideWhenAiming = true;  // fade the head out when you look straight at the player
-    private static int aimRadius = 20;             // pixels around the crosshair
+    private static boolean hideWhenVisible = true; // fade the head out while you can actually see the player
     private static boolean openConfigNextTick = false;
 
     /** Show the HUD as a preview until this time (after moving it). */
@@ -142,6 +143,11 @@ public class TeamLocatorClient implements ClientModInitializer {
     private static final Map<String, double[]> SMOOTH = new ConcurrentHashMap<>();
     /** Per player: current alpha, hidden-by-aim flag (0/1). Gives smooth fading without flicker. */
     private static final Map<String, float[]> FADE = new ConcurrentHashMap<>();
+    /** Per player: lastCheckNs, visibleSinceNs (0 = not visible), lastVisibleNs. */
+    private static final Map<String, long[]> VIS = new ConcurrentHashMap<>();
+    private static final long VIS_CHECK_NS = 80_000_000L;   // line-of-sight check every 80 ms
+    private static final long VIS_HIDE_NS = 150_000_000L;   // must be visible 150 ms before hiding
+    private static final long VIS_SHOW_NS = 300_000_000L;   // must be hidden 300 ms before showing again
     private static long lastHeadFrameNs = 0;
     private static final String[] ARROWS = {"↑", "↗", "→", "↘", "↓", "↙", "←", "↖"};
 
@@ -254,6 +260,7 @@ public class TeamLocatorClient implements ClientModInitializer {
         MARKS.values().removeIf(m -> now - m.timeMs() > EXPIRE_SECONDS * 1000L);
         SMOOTH.keySet().retainAll(MARKS.keySet());
         FADE.keySet().retainAll(MARKS.keySet());
+        VIS.keySet().retainAll(MARKS.keySet());
 
         if (!enabled || !sharing || !onServer || link == null) return;
         if (lastSendMs != 0 && ++tickCounter < Math.max(5, intervalMs / 50)) return;
@@ -543,14 +550,27 @@ public class TeamLocatorClient implements ClientModInitializer {
                 arrow = EDGE_ARROWS[idx] + " ";
             }
 
-            // Fade out when you look straight at the player (with hysteresis -> no flicker)
+            // Fade out while you can really see the player: on screen AND no blocks in between.
+            // Checked every 80 ms with a delay in both directions -> no flicker.
             float[] fade = FADE.computeIfAbsent(key, k -> new float[]{0f, 0f});
-            if (hideWhenAiming && onScreen) {
-                double fromCenter = Math.hypot(sx - cx, sy - cy);
-                if (fromCenter < aimRadius) fade[1] = 1f;                 // hide
-                else if (fromCenter > aimRadius * 1.5 + 4) fade[1] = 0f;  // show again
+            if (hideWhenVisible && ent != null) {
+                long[] vis = VIS.computeIfAbsent(key, k -> new long[]{0L, 0L, 0L});
+                if (nowNs - vis[0] > VIS_CHECK_NS) {
+                    vis[0] = nowNs;
+                    boolean seen = canSee(mc, ent, pt, camPos, toCamera, scale, cx, cy, w, h);
+                    if (seen) {
+                        if (vis[1] == 0L) vis[1] = nowNs;
+                        vis[2] = nowNs;
+                    } else {
+                        vis[1] = 0L;
+                    }
+                }
+                if (vis[1] != 0L && nowNs - vis[1] >= VIS_HIDE_NS) fade[1] = 1f;   // seen long enough -> hide
+                else if (nowNs - vis[2] >= VIS_SHOW_NS) fade[1] = 0f;              // hidden long enough -> show
             } else {
+                // Not loaded (far away) or option off -> you can't see them, keep the marker
                 fade[1] = 0f;
+                VIS.remove(key);
             }
             float target = fade[1] == 1f ? 0f : 1f;
             fade[0] += (float) ((target - fade[0]) * (1 - Math.exp(-frameDt * 12.0)));
@@ -580,6 +600,35 @@ public class TeamLocatorClient implements ClientModInitializer {
                         withAlpha(stale ? 0xAAAAAA : 0xFFFFFF, alpha), alpha);
             }
         }
+    }
+
+    /**
+     * True if the player is inside your view and at least one point of their body (head, chest
+     * or feet) can be reached from the camera without hitting a block.
+     */
+    private static boolean canSee(Minecraft mc, Player ent, float pt, Vec3 camPos, Quaternionf toCamera,
+                                  double scale, double cx, double cy, int w, int h) {
+        if (ent.isInvisible()) return false;
+        Vec3 base = ent.getPosition(pt);
+        double height = ent.getBbHeight();
+        double[] offsets = {height * 0.9, height * 0.5, 0.15};
+        for (double off : offsets) {
+            Vec3 point = base.add(0, off, 0);
+            // 1) inside the visible screen area?
+            Vector3f v = new Vector3f((float) (point.x - camPos.x), (float) (point.y - camPos.y),
+                    (float) (point.z - camPos.z));
+            toCamera.transform(v);
+            double depth = -v.z();
+            if (depth <= 0.05) continue;
+            double px = cx + v.x() / depth * scale;
+            double py = cy - v.y() / depth * scale;
+            if (px < 0 || px > w || py < 0 || py > h) continue;
+            // 2) nothing solid in between?
+            HitResult hit = mc.level.clip(new ClipContext(camPos, point, ClipContext.Block.COLLIDER,
+                    ClipContext.Fluid.NONE, mc.player));
+            if (hit.getType() == HitResult.Type.MISS) return true;
+        }
+        return false;
     }
 
     private static int withAlpha(int rgb, float alpha) {
@@ -792,12 +841,11 @@ public class TeamLocatorClient implements ClientModInitializer {
         showHeadName = Boolean.parseBoolean(p.getProperty("showHeadName", "" + showHeadName));
         edgeMarkers = Boolean.parseBoolean(p.getProperty("edgeMarkers", "" + edgeMarkers));
         showList = Boolean.parseBoolean(p.getProperty("showList", "" + showList));
-        hideWhenAiming = Boolean.parseBoolean(p.getProperty("hideWhenAiming", "" + hideWhenAiming));
+        hideWhenVisible = Boolean.parseBoolean(p.getProperty("hideWhenVisible", "" + hideWhenVisible));
         try {
             headSize = Math.max(8, Math.min(32, Integer.parseInt(p.getProperty("headSize", "" + headSize))));
             hideCloser = Math.max(0, Integer.parseInt(p.getProperty("hideCloser", "" + hideCloser)));
             maxHeadDistance = Math.max(0, Integer.parseInt(p.getProperty("maxHeadDistance", "" + maxHeadDistance)));
-            aimRadius = Math.max(5, Math.min(100, Integer.parseInt(p.getProperty("aimRadius", "" + aimRadius))));
         } catch (NumberFormatException ignored) { }
         String corner = p.getProperty("hudCorner", hudCorner);
         if (List.of("topleft", "topright", "bottomleft", "bottomright").contains(corner)) hudCorner = corner;
@@ -824,8 +872,7 @@ public class TeamLocatorClient implements ClientModInitializer {
         p.setProperty("headSize", "" + headSize);
         p.setProperty("hideCloser", "" + hideCloser);
         p.setProperty("maxHeadDistance", "" + maxHeadDistance);
-        p.setProperty("hideWhenAiming", "" + hideWhenAiming);
-        p.setProperty("aimRadius", "" + aimRadius);
+        p.setProperty("hideWhenVisible", "" + hideWhenVisible);
         p.setProperty("hudOffsetX", "" + hudOffsetX);
         p.setProperty("hudOffsetY", "" + hudOffsetY);
         try {
@@ -851,7 +898,6 @@ public class TeamLocatorClient implements ClientModInitializer {
         private static final int[] MAXD = {0, 100, 250, 500, 1000, 2500, 5000};
         private static final int[] SPEED = {250, 500, 1000, 2000, 5000};
         private static final int[] SCALE = {50, 60, 75, 90, 100, 125, 150};
-        private static final int[] AIM = {10, 15, 20, 30, 40, 60};
         private static final String[] CORNERS = {"topleft", "topright", "bottomleft", "bottomright"};
 
         private final Screen parent;
@@ -938,10 +984,8 @@ public class TeamLocatorClient implements ClientModInitializer {
             addRenderableWidget(cycle(rightX, y + row * 6, colW, "Max distance",
                     () -> maxHeadDistance == 0 ? "unlimited" : maxHeadDistance + " blocks",
                     () -> maxHeadDistance = next(MAXD, maxHeadDistance)));
-            addRenderableWidget(toggle(rightX, y + row * 7, colW, "Hide when aiming", () -> hideWhenAiming,
-                    () -> hideWhenAiming = !hideWhenAiming));
-            addRenderableWidget(cycle(rightX, y + row * 8, colW, "Aim radius",
-                    () -> aimRadius + " px", () -> aimRadius = next(AIM, aimRadius)));
+            addRenderableWidget(toggle(rightX, y + row * 7, colW, "Hide when visible", () -> hideWhenVisible,
+                    () -> hideWhenVisible = !hideWhenVisible));
 
             addRenderableWidget(Button.builder(Component.literal("Done"), b -> onClose())
                     .bounds(this.width / 2 - 100, this.height - 26, 200, 20).build());
